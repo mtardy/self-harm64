@@ -1,0 +1,108 @@
+# This GitHub action is special: it's specific to the self-hosted runner on
+# which it's supposed to take place. Indeed on this self-hosted runner, the
+# action runs directly as a superuser without any containerization mechanism or
+# isolation in the filesystem. 
+#
+# Please check the documentation to setup the runner and make this action works.
+
+name: KVM Go Tests (arm64)
+
+# TODO: change that
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  run-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel:
+          # renovate: datasource=docker depName=quay.io/lvh-images/kind
+          - "bpf-next-20240415.162748"
+          # renovate: datasource=docker depName=quay.io/lvh-images/kind
+          - "6.6-20240415.162748"
+          # renovate: datasource=docker depName=quay.io/lvh-images/kind
+          - "6.1-20240415.162748"
+          # renovate: datasource=docker depName=quay.io/lvh-images/kind
+          - "5.15-20240415.162748"
+          # renovate: datasource=docker depName=quay.io/lvh-images/kind
+          - "5.10-20240415.162748"
+          # renovate: datasource=docker depName=quay.io/lvh-images/kind
+          - "5.4-20240415.162748"
+          # renovate: datasource=docker depName=quay.io/lvh-images/kind
+          - "4.19-20240415.162748"
+    runs-on: 'splendid-metal-enormous-arm64'
+    env:
+      SHARED_FOLDER: /home/runners
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      # TODO: replace that with `lvh kernels pull <tag>` when it's available
+      # Local caching mechanism since we run on the same runner, we could use GitHub cache also
+      - name: Download the kernel
+        run: |
+          if [ ! -e "$SHARED_FOLDER/vmlinuz-${{ matrix.kernel }}" ]; then
+            v="${{ matrix.kernel }}"
+            v="${v%-*}"
+            kernel="quay.io/lvh-images/kernel-images:${{ matrix.kernel }}"
+            mkdir -p $SHARED_FOLDER
+            crane export $kernel --platform linux/$(dpkg --print-architecture) kernel_$v.tar
+            tar --transform="s#data/kernels/$v/boot/##g" --wildcards -xvf kernel_$v.tar data/kernels/$v/boot/vmlinuz*
+            mv vmlinuz* $SHARED_FOLDER/vmlinuz-${{ matrix.kernel }}
+            rm kernel_$v.tar
+          fi
+
+      # this is racy but it should be fine
+      - name: Find a random available port
+        id: port-ssh
+        run: echo port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()') >> $GITHUB_OUTPUT
+
+      # TODO: replace with a released version
+      - name: Provision LVH VM
+        uses: cilium/little-vm-helper@c7fd9bc22f9a83da2ba7b793c9a4947249414d63
+        with:
+          test-name: tetragon-unit-tests
+          image: kind
+          image-version: '${{ matrix.kernel }}'
+          images-folder-parent: '${{ env.SHARED_FOLDER }}'
+          kernel: '${{ env.SHARED_FOLDER }}/vmlinuz-${{ matrix.kernel }}'
+          host-mount: ./
+          ssh-port: ${{ steps.port-ssh.outputs.port }}
+          mem: 4G
+          cpu: 2
+          cmd: |
+            uname -a
+
+            # wait for network to be available
+            while true;
+            do
+              wget --spider -q -T 10  http://google.com && break
+              sleep 10
+            done
+
+            apt-get update
+            apt-get install -y libelf-dev
+
+      - name: Cleanup LVH mess
+        if: ${{ always() }}
+        run: |
+          set +e
+          # stop our VM
+          ssh -p ${{ steps.port-ssh.outputs.port }} -o ConnectTimeout=5 root@localhost poweroff
+          # cleanup my images
+          find /home/runners -user $(whoami) -type f -iname '*.qcow2' -delete
+          find /home/runners -user $(whoami) -type f -iname '*.zst' -delete
+          # cleanup shared folder cache, trash all files older than 7 days
+          find /home/runners -mtime +7 -type f -exec rm {} \;
+
+  # cleanup:
+  #   needs: run-tests
+  #   runs-on: 'splendid-metal-enormous-arm64'
+  #   steps:
+  #     - name: Cleanup potential remaining VMs
+  #       run: |
+  #         sudo pkill qemu
